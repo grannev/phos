@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <netinet/in.h>
 
-void clnt_init(struct client *clnt)
+void stcp_clnt_init(struct stcp_client *clnt)
 {
     if (!clnt)
         return;
@@ -14,12 +14,12 @@ void clnt_init(struct client *clnt)
     clnt->addr = malloc(sizeof(struct sockaddr_in));
     clnt->in_len = 0;
     clnt->out_buffer = NULL;
-    clnt->in_buffer[GTCP_CLIENT_BUFF_SIZE - 1] = '\0';
+    clnt->in_buffer[STCP_CLIENT_BUFF_SIZE - 1] = '\0';
     clnt->out_len = 0;
     clnt->out_sent = 0;
 }
 
-void clnt_iwd(struct client *clnt, int cfd)
+void stcp_clnt_iwd(struct stcp_client *clnt, int cfd)
 {
     if (!clnt)
         return;
@@ -28,20 +28,18 @@ void clnt_iwd(struct client *clnt, int cfd)
     clnt->is_connected = 1;
 }
 
-void clnt_free(struct client *clnt)
+void stcp_clnt_free(struct stcp_client *clnt)
 {
     if (!clnt)
         return;
 
     clnt->is_connected = 0;
-    if (clnt->out_buffer)
-        free(clnt->out_buffer);
     if (clnt->addr)
         free(clnt->addr);
     close(clnt->fd);
 }
 
-void cl_init(struct client_list *clients)
+void stcp_cl_init(struct stcp_client_list *clients)
 {
     if (!clients)
         return;
@@ -50,14 +48,14 @@ void cl_init(struct client_list *clients)
     clients->head = NULL;
 }
 
-void cl_push(struct client_list *clients, struct client *clnt)
+void stcp_cl_push(struct stcp_client_list *clients, struct stcp_client *clnt)
 {
-    struct client_node *new_node, *curr;
+    struct stcp_client_node *new_node, *curr;
 
     if (!clients || !clnt)
         return;
 
-    new_node = malloc(sizeof(struct client_node));
+    new_node = malloc(sizeof(struct stcp_client_node));
     new_node->data = clnt;
     new_node->next = NULL;
     
@@ -83,9 +81,9 @@ void cl_push(struct client_list *clients, struct client *clnt)
     clients->size++;
 }
 
-void cl_remv(struct client_list *clients, struct client *clnt)
+void stcp_cl_remv(struct stcp_client_list *clients, struct stcp_client *clnt)
 {
-    struct client_node *curr;
+    struct stcp_client_node *curr;
 
     if (!clients || !clnt)
         return;
@@ -94,23 +92,23 @@ void cl_remv(struct client_list *clients, struct client *clnt)
     while (curr->next || curr->data->fd != clnt->fd)
         curr = curr->next;
     
-    clnt_free(curr->data);
+    stcp_clnt_free(curr->data);
 }
 
-static void cl_free_rec(struct client_node *node)
+static void stcp_cl_free_rec(struct stcp_client_node *node)
 {
     if (!node)
         return;
     if (node->next)
-        cl_free_rec(node->next);
+        stcp_cl_free_rec(node->next);
     free(node);
     node = NULL;
 }
 
-void cl_free(struct client_list *clients)
+void stcp_cl_free(struct stcp_client_list *clients)
 {
     if (!clients)
         return;
-    cl_free_rec(clients->head);
+    stcp_cl_free_rec(clients->head);
 }
 

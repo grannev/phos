@@ -1,4 +1,25 @@
-#include "server.h"
+#include "phos_tcp.h"
+#include "client.h"
+
+#ifndef STCP_LISTEN_QUEUE
+#define STCP_LISTEN_QUEUE 16
+#endif
+
+#ifndef STCP_SERVER_ADDR
+#define STCP_SERVER_ADDR "127.0.0.1"
+#endif
+
+#ifndef STCP_SERVER_PORT
+#define STCP_SERVER_PORT 8080
+#endif
+
+#ifndef STCP_TIMEOUT_SEC
+#define STCP_TIMEOUT_SEC 60
+#endif
+
+#ifndef STCP_TIMEOUT_USEC
+#define STCP_TIMEOUT_USEC 60
+#endif
 
 #include <stdio.h>
 #include <errno.h>
@@ -10,19 +31,19 @@
 #include <sys/socket.h>
 #include <sys/select.h>
 
-void gtcp_init(struct gtcp_ctx *ctx)
+void stcp_init(struct stcp_ctx *ctx)
 {
     int ok;
 
     /* TODO: Error processing */
 
     ctx->clnt = NULL;
-    ctx->clients = malloc(sizeof(struct client_list));
-    cl_init(ctx->clients);
+    ctx->clients = malloc(sizeof(struct stcp_client_list));
+    stcp_cl_init(ctx->clients);
 
     ctx->timeout = malloc(sizeof(struct timeval));
-    ctx->timeout->tv_sec = GTCP_TIMEOUT_SEC;
-    ctx->timeout->tv_usec = GTCP_TIMEOUT_USEC;
+    ctx->timeout->tv_sec = STCP_TIMEOUT_SEC;
+    ctx->timeout->tv_usec = STCP_TIMEOUT_USEC;
 
     ctx->sfd = socket(AF_INET, SOCK_STREAM, 0);
     if (ctx->sfd == -1) {
@@ -31,15 +52,15 @@ void gtcp_init(struct gtcp_ctx *ctx)
     
     ctx->addr = malloc(sizeof(struct sockaddr_in));
     ctx->addr->sin_family = AF_INET;
-    ctx->addr->sin_port = htons(GTCP_SERVER_PORT);
+    ctx->addr->sin_port = htons(STCP_SERVER_PORT);
 
-    ok = inet_aton(GTCP_SERVER_ADDR, &ctx->addr->sin_addr);
+    ok = inet_aton(STCP_SERVER_ADDR, &ctx->addr->sin_addr);
     if (!ok) {
         exit(1);
     }
 }
 
-void gtcp_set_addr(struct gtcp_ctx *ctx, const char *addr)
+void stcp_set_addr(struct stcp_ctx *ctx, const char *addr)
 {
     int ok;
 
@@ -49,13 +70,13 @@ void gtcp_set_addr(struct gtcp_ctx *ctx, const char *addr)
     }
 }
 
-void gtcp_set_handler(struct gtcp_ctx *ctx,
-                      void (*handler)(struct gtcp_ctx*))
+void stcp_set_handler(struct stcp_ctx *ctx,
+                      void (*handler)(struct stcp_ctx*))
 {
     ctx->handler = handler;
 }
 
-void gtcp_free(struct gtcp_ctx *ctx)
+void stcp_free(struct stcp_ctx *ctx)
 {
     ctx->clnt = NULL;
     if (ctx->timeout)
@@ -68,7 +89,7 @@ void gtcp_free(struct gtcp_ctx *ctx)
     close(ctx->sfd);
 }
 
-void gtcp_listen(struct gtcp_ctx *ctx)
+void stcp_listen(struct stcp_ctx *ctx)
 {
     int opt;
     int res;
@@ -85,21 +106,21 @@ void gtcp_listen(struct gtcp_ctx *ctx)
         exit(1);
     }
 
-    res = listen(ctx->sfd, GTCP_LISTEN_QUEUE);
+    res = listen(ctx->sfd, STCP_LISTEN_QUEUE);
     if (res == -1) {
         exit(1);
     }
-    printf("Listening on %s:%d...\n", GTCP_SERVER_ADDR, GTCP_SERVER_PORT);
+    printf("Listening on %s:%d...\n", STCP_SERVER_ADDR, STCP_SERVER_PORT);
 }
 
-static void gtcp_el_set_fds(struct gtcp_ctx *ctx)
+static void stcp_el_set_fds(struct stcp_ctx *ctx)
 {
     int cfd;
 
     ctx->max_fd = ctx->sfd;
     
-    struct client_node *curr;
-    struct client *clnt;
+    struct stcp_client_node *curr;
+    struct stcp_client *clnt;
 
     FD_ZERO(&ctx->readfds);
     FD_ZERO(&ctx->writefds);
@@ -125,14 +146,15 @@ static void gtcp_el_set_fds(struct gtcp_ctx *ctx)
     }
 }
 
-static int gtcp_el_select(struct gtcp_ctx *ctx)
+static int stcp_el_select(struct stcp_ctx *ctx)
 {
     int res;
 
-    ctx->timeout->tv_sec = GTCP_TIMEOUT_SEC;
-    ctx->timeout->tv_usec = GTCP_TIMEOUT_USEC;
+    ctx->timeout->tv_sec = STCP_TIMEOUT_SEC;
+    ctx->timeout->tv_usec = STCP_TIMEOUT_USEC;
 
-    res = select(ctx->max_fd + 1, &ctx->readfds, &ctx->writefds, NULL, ctx->timeout);
+    res = select(ctx->max_fd + 1, &ctx->readfds, &ctx->writefds, NULL,
+                 ctx->timeout);
     if (res == -1) {
         if (errno == EINTR) {}
         else {}
@@ -140,22 +162,22 @@ static int gtcp_el_select(struct gtcp_ctx *ctx)
     }
 
     if (res == 0) {
-        /* Событие тайм аут */
+        /* Timeout event */
         return 1;
     }
 
     return 0;
 }
 
-static void gtcp_el_accept(struct gtcp_ctx *ctx)
+static void stcp_el_accept(struct stcp_ctx *ctx)
 {
     int cfd;
     int flags;
     unsigned int client_addr_len;
 
     if (FD_ISSET(ctx->sfd, &ctx->readfds)) {
-        ctx->clnt = malloc(sizeof(struct client));
-        clnt_init(ctx->clnt);
+        ctx->clnt = malloc(sizeof(struct stcp_client));
+        stcp_clnt_init(ctx->clnt);
 
         client_addr_len = sizeof(*ctx->clnt->addr);
         cfd = accept(ctx->sfd, (struct sockaddr*)ctx->clnt->addr,
@@ -169,18 +191,18 @@ static void gtcp_el_accept(struct gtcp_ctx *ctx)
         flags = fcntl(cfd, F_GETFL);
         fcntl(cfd, F_SETFL, flags | O_NONBLOCK);
 
-        clnt_iwd(ctx->clnt, cfd);
-        cl_push(ctx->clients, ctx->clnt);
+        stcp_clnt_iwd(ctx->clnt, cfd);
+        stcp_cl_push(ctx->clients, ctx->clnt);
     }
 }
 
-/* gTCP event loop bust clients file descriptors */
-static void gtcp_el_bust_cfds(struct gtcp_ctx *ctx)
+/* (pho)sTCP event loop bust clients file descriptors */
+static void stcp_el_bust_cfds(struct stcp_ctx *ctx)
 {
     int res;
     int cfd;
 
-    struct client_node *curr;
+    struct stcp_client_node *curr;
 
     curr = ctx->clients->head;
     while (curr) {
@@ -193,14 +215,14 @@ static void gtcp_el_bust_cfds(struct gtcp_ctx *ctx)
         }
 
         if (FD_ISSET(cfd, &ctx->readfds)) {
-            res = read(cfd, ctx->clnt->in_buffer, GTCP_CLIENT_BUFF_SIZE - 1);
+            res = read(cfd, ctx->clnt->in_buffer, STCP_CLIENT_BUFF_SIZE - 1);
 
             if (res == -1) {
                 curr = curr->next;
                 continue;
             }
             if (res == 0) {
-                clnt_free(ctx->clnt);
+                stcp_clnt_free(ctx->clnt);
                 curr = curr->next;
                 continue;
             } else {
@@ -212,7 +234,20 @@ static void gtcp_el_bust_cfds(struct gtcp_ctx *ctx)
         }
 
         if (FD_ISSET(cfd, &ctx->writefds)) {
-
+            res = write(cfd, ctx->clnt->out_buffer + ctx->clnt->out_sent,
+                        ctx->clnt->out_len);
+            if (res == -1) {
+                curr = curr->next;
+                continue;
+            }
+            if (res == 0) {
+                curr = curr->next;
+                continue;
+            } else {
+                ctx->clnt->out_sent += res;
+                if (ctx->clnt->out_sent == ctx->clnt->out_len)
+                    free(ctx->clnt->out_buffer);
+            }
         }
 
         curr = curr->next;
@@ -220,18 +255,18 @@ static void gtcp_el_bust_cfds(struct gtcp_ctx *ctx)
 
 }
 
-static void gtcp_event_loop(struct gtcp_ctx *ctx)
+void stcp_event_loop(struct stcp_ctx *ctx)
 {
     int res;
 
     for (;;) {
-        gtcp_el_set_fds(ctx);
+        stcp_el_set_fds(ctx);
 
         /* 
          * No need to go through list of clients if return 1
          * otherwise need to check them
          */
-        res = gtcp_el_select(ctx);
+        res = stcp_el_select(ctx);
         if (res)
             continue;
 
@@ -239,34 +274,28 @@ static void gtcp_event_loop(struct gtcp_ctx *ctx)
          * If there's someone we can accept, this function will add new
          * client connection to the ctx.clients
          */
-        gtcp_el_accept(ctx);
+        stcp_el_accept(ctx);
         
-        gtcp_el_bust_cfds(ctx);
+        stcp_el_bust_cfds(ctx);
     }
 }
 
-void echo_handler(struct gtcp_ctx *ctx)
-{
-    puts(ctx->clnt->in_buffer);
 
-    ctx->clnt->out_buffer = malloc(ctx->clnt->in_len + 1);
-    ctx->clnt->out_buffer[ctx->clnt->in_len] = '\0';
-    strcpy(ctx->clnt->out_buffer, ctx->clnt->in_buffer);
-    ctx->clnt->out_len = ctx->clnt->in_len;
-    write(ctx->clnt->fd, ctx->clnt->out_buffer, ctx->clnt->out_len);
-    ctx->clnt->out_sent = ctx->clnt->out_len;
-    free(ctx->clnt->out_buffer);
-    ctx->clnt->out_buffer = NULL;
+void stcp_write(struct stcp_ctx *ctx, char *msg, int len)
+{
+    ctx->clnt->out_buffer = malloc(len + 1);
+    ctx->clnt->out_buffer[len] = '\0';
+    memcpy(ctx->clnt->out_buffer, msg, len);
+    ctx->clnt->out_len = len;
+    ctx->clnt->out_sent = 0;
 }
 
-void gtcp_run_echo()
+char *stcp_get_msg(struct stcp_ctx *ctx)
 {
-    struct gtcp_ctx ctx;
-
-    gtcp_init(&ctx);
-    gtcp_set_handler(&ctx, echo_handler);
-    gtcp_listen(&ctx);
-    gtcp_event_loop(&ctx);
-    gtcp_free(&ctx);
+    return ctx->clnt->in_buffer;
 }
 
+int stcp_get_msg_len(struct stcp_ctx *ctx)
+{
+    return ctx->clnt->in_len;
+}
