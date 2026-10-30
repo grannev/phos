@@ -59,7 +59,7 @@ int main()
     /* Echo Client Begin */
     for (;;) {
         printf("> ");
-        scanf("%s", buffer);
+        fgets(buffer, BUFF_SIZE, stdin);
 
         res = write(client_fd, buffer, 20);
         if (res == -1) {
@@ -86,5 +86,6 @@ int main()
     /* TODO: Error Processing */
         exit(1);
     }
+    close(client_fd);
 }
 

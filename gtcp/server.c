@@ -3,243 +3,270 @@
 #include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 
-#ifndef GTCP_LISTEN_QUEUE
-#define GTCP_LISTEN_QUEUE 16
-#endif
-
-#ifndef GTCP_SERVER_ADDR
-#define GTCP_SERVER_ADDR "127.0.0.1"
-#endif
-
-#ifndef GTCP_SERVER_PORT
-#define GTCP_SERVER_PORT 8080
-#endif
-
-static void clear_buffer(char *buffer, int size)
+void gtcp_init(struct gtcp_ctx *ctx)
 {
-    int i;
-    for (i = 0; i < size || buffer[i] != '\0'; i++)
-        buffer[i] = '\0';
-}
+    int ok;
 
+    /* TODO: Error processing */
 
-void cl_init(struct client_list *clients)
-{
-    clients->size = 0;
-    clients->head = NULL;
-}
+    ctx->clnt = NULL;
+    ctx->clients = malloc(sizeof(struct client_list));
+    cl_init(ctx->clients);
 
-void cl_push(struct client_list *clients, struct client *clnt)
-{
-    struct client_node *node, *curr;
+    ctx->timeout = malloc(sizeof(struct timeval));
+    ctx->timeout->tv_sec = GTCP_TIMEOUT_SEC;
+    ctx->timeout->tv_usec = GTCP_TIMEOUT_USEC;
 
-    node = malloc(sizeof(struct client_node));
-    node->data = clnt;
-    node->next = NULL;
+    ctx->sfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (ctx->sfd == -1) {
+        exit(1);
+    }
     
-    if (clients->head == NULL) {
-        clients->head = node;
-        clients->size++;
-        return;
+    ctx->addr = malloc(sizeof(struct sockaddr_in));
+    ctx->addr->sin_family = AF_INET;
+    ctx->addr->sin_port = htons(GTCP_SERVER_PORT);
+
+    ok = inet_aton(GTCP_SERVER_ADDR, &ctx->addr->sin_addr);
+    if (!ok) {
+        exit(1);
     }
-
-    curr = clients->head;
-    while (curr->next != NULL && curr->data->is_connected)
-        curr = curr->next;
-
-    if (curr->data->is_connected) {
-        free(curr->data);
-        free(node);
-        curr->data = clnt;
-        clients->size++;
-        return;
-    }
-
-    curr->next = node;
-    clients->size++;
 }
 
-void cl_remv(struct client_list *clients, struct client *clnt)
+void gtcp_set_addr(struct gtcp_ctx *ctx, const char *addr)
 {
+    int ok;
+
+    ok = inet_aton(addr, &ctx->addr->sin_addr);
+    if (!ok) {
+        exit(1);
+    }
+}
+
+void gtcp_set_handler(struct gtcp_ctx *ctx,
+                      void (*handler)(struct gtcp_ctx*))
+{
+    ctx->handler = handler;
+}
+
+void gtcp_free(struct gtcp_ctx *ctx)
+{
+    ctx->clnt = NULL;
+    if (ctx->timeout)
+        free(ctx->timeout);
+    if (ctx->addr)
+        free(ctx->addr);
+    if (ctx->clients)
+        free(ctx->clients);
+
+    close(ctx->sfd);
+}
+
+void gtcp_listen(struct gtcp_ctx *ctx)
+{
+    int opt;
+    int res;
+
+    opt = 1;
+    res = setsockopt(ctx->sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (res == -1) {
+        exit(1);
+    }
+
+    res = bind(ctx->sfd, (struct sockaddr*)ctx->addr,
+               sizeof(*ctx->addr));
+    if (res == -1) {
+        exit(1);
+    }
+
+    res = listen(ctx->sfd, GTCP_LISTEN_QUEUE);
+    if (res == -1) {
+        exit(1);
+    }
+    printf("Listening on %s:%d...\n", GTCP_SERVER_ADDR, GTCP_SERVER_PORT);
+}
+
+static void gtcp_el_set_fds(struct gtcp_ctx *ctx)
+{
+    int cfd;
+
+    ctx->max_fd = ctx->sfd;
+    
     struct client_node *curr;
-    
-    curr = clients->head;
-    while (curr->next != NULL || curr->data->fd != clnt->fd)
+    struct client *clnt;
+
+    FD_ZERO(&ctx->readfds);
+    FD_ZERO(&ctx->writefds);
+    FD_SET(ctx->sfd, &ctx->readfds);
+
+    curr = ctx->clients->head;
+    while (curr) {
+        clnt = curr->data;
+        cfd = clnt->fd;
+
+        if (!clnt->is_connected) {
+            curr = curr->next;
+            continue;
+        }
+
+        FD_SET(cfd, &ctx->readfds);
+        if (clnt->out_sent < clnt->out_len)
+            FD_SET(cfd, &ctx->writefds);
+        if (cfd > ctx->max_fd)
+            ctx->max_fd = cfd;
+
         curr = curr->next;
-    
-    curr->data->is_connected = 0;
+    }
 }
 
-static void cl_free_rec(struct client_node *node)
+static int gtcp_el_select(struct gtcp_ctx *ctx)
 {
-    if (node == NULL)
-        return;
-    if (node->next == NULL)
-        free(node);
-    else
-        cl_free_rec(node->next);
+    int res;
+
+    ctx->timeout->tv_sec = GTCP_TIMEOUT_SEC;
+    ctx->timeout->tv_usec = GTCP_TIMEOUT_USEC;
+
+    res = select(ctx->max_fd + 1, &ctx->readfds, &ctx->writefds, NULL, ctx->timeout);
+    if (res == -1) {
+        if (errno == EINTR) {}
+        else {}
+        return 1;
+    }
+
+    if (res == 0) {
+        /* Событие тайм аут */
+        return 1;
+    }
+
+    return 0;
 }
 
-void cl_free(struct client_list *clients)
+static void gtcp_el_accept(struct gtcp_ctx *ctx)
 {
-    cl_free_rec(clients->head);
+    int cfd;
+    int flags;
+    unsigned int client_addr_len;
+
+    if (FD_ISSET(ctx->sfd, &ctx->readfds)) {
+        ctx->clnt = malloc(sizeof(struct client));
+        clnt_init(ctx->clnt);
+
+        client_addr_len = sizeof(*ctx->clnt->addr);
+        cfd = accept(ctx->sfd, (struct sockaddr*)ctx->clnt->addr,
+                           &client_addr_len);
+        if (cfd == -1)
+            exit(1);
+        printf("Accepted connection with %s:%d\n",
+               inet_ntoa(ctx->clnt->addr->sin_addr),
+               ntohs(ctx->clnt->addr->sin_port));
+
+        flags = fcntl(cfd, F_GETFL);
+        fcntl(cfd, F_SETFL, flags | O_NONBLOCK);
+
+        clnt_iwd(ctx->clnt, cfd);
+        cl_push(ctx->clients, ctx->clnt);
+    }
+}
+
+/* gTCP event loop bust clients file descriptors */
+static void gtcp_el_bust_cfds(struct gtcp_ctx *ctx)
+{
+    int res;
+    int cfd;
+
+    struct client_node *curr;
+
+    curr = ctx->clients->head;
+    while (curr) {
+        ctx->clnt = curr->data;
+        cfd = ctx->clnt->fd;
+
+        if (!ctx->clnt->is_connected) {
+            curr = curr->next;
+            continue;
+        }
+
+        if (FD_ISSET(cfd, &ctx->readfds)) {
+            res = read(cfd, ctx->clnt->in_buffer, GTCP_CLIENT_BUFF_SIZE - 1);
+
+            if (res == -1) {
+                curr = curr->next;
+                continue;
+            }
+            if (res == 0) {
+                clnt_free(ctx->clnt);
+                curr = curr->next;
+                continue;
+            } else {
+                printf("Receiving data...\n");
+                ctx->clnt->in_buffer[res] = '\0';
+                curr->data->in_len = res;
+                ctx->handler(ctx);
+            }
+        }
+
+        if (FD_ISSET(cfd, &ctx->writefds)) {
+
+        }
+
+        curr = curr->next;
+    }
+
+}
+
+static void gtcp_event_loop(struct gtcp_ctx *ctx)
+{
+    int res;
+
+    for (;;) {
+        gtcp_el_set_fds(ctx);
+
+        /* 
+         * No need to go through list of clients if return 1
+         * otherwise need to check them
+         */
+        res = gtcp_el_select(ctx);
+        if (res)
+            continue;
+
+        /* 
+         * If there's someone we can accept, this function will add new
+         * client connection to the ctx.clients
+         */
+        gtcp_el_accept(ctx);
+        
+        gtcp_el_bust_cfds(ctx);
+    }
+}
+
+void echo_handler(struct gtcp_ctx *ctx)
+{
+    puts(ctx->clnt->in_buffer);
+
+    ctx->clnt->out_buffer = malloc(ctx->clnt->in_len + 1);
+    ctx->clnt->out_buffer[ctx->clnt->in_len] = '\0';
+    strcpy(ctx->clnt->out_buffer, ctx->clnt->in_buffer);
+    ctx->clnt->out_len = ctx->clnt->in_len;
+    write(ctx->clnt->fd, ctx->clnt->out_buffer, ctx->clnt->out_len);
+    ctx->clnt->out_sent = ctx->clnt->out_len;
+    free(ctx->clnt->out_buffer);
+    ctx->clnt->out_buffer = NULL;
 }
 
 void gtcp_run_echo()
 {
-    int ok;
-    int res;
-    int opt;
-    int flags;
-    int max_fd;
-    int server_fd;
-    int client_fd;
-    fd_set readfds;
-    fd_set writefds;
-    unsigned int client_addr_len;
+    struct gtcp_ctx ctx;
 
-    struct client_list clients;
-    struct sockaddr_in server_addr;
-    struct client_node *curr;
-    struct timeval timeout;
-    struct client *clnt;
-    
-
-    char buffer[GTCP_BUFF_SIZE];
-
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
-    /* TODO: Error Processing */
-        exit(1);
-    }
-    
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(GTCP_SERVER_PORT);
-    ok = inet_aton(GTCP_SERVER_ADDR, &server_addr.sin_addr);
-    if (!ok) {
-    /* TODO: Error Processing */
-        exit(1);
-    }
-
-    opt = 1;
-    res = setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    if (res == -1) {
-    /* TODO: Error Processing */
-        exit(1);
-    }
-
-    res = bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr));
-    if (res == -1) {
-    /* TODO: Error Processing */
-        exit(1);
-    }
-
-    res = listen(server_fd, GTCP_LISTEN_QUEUE);
-    if (res == -1) {
-    /* TODO: Error Processing */
-        exit(1);
-    }
-    printf("Listening on %s:%d...\n", GTCP_SERVER_ADDR, GTCP_SERVER_PORT);
-
-    
-    /* Echo Server Begin */
-    for (;;) {
-        FD_ZERO(&readfds);
-        FD_ZERO(&writefds);
-        FD_SET(server_fd, &readfds);
-
-        curr = clients.head;
-        while (curr) {
-            client_fd = curr->data->fd;
-
-            FD_SET(client_fd, &readfds);
-            if (curr->data->out_sent < curr->data->out_size)
-                FD_SET(client_fd, &writefds);
-            if (client_fd > max_fd)
-                max_fd = client_fd;
-
-            curr = curr->next;
-        }
-        timeout.tv_sec = 60;
-        timeout.tv_usec = 0;
-
-        res = select(max_fd + 1, &readfds, &writefds, NULL, &timeout);
-        if (res == -1) {
-            if (errno == EINTR) {}
-            else {}
-            continue;
-        }
-
-        if (res == 0) {
-            /* Событие тайм аут */
-            continue;
-        }
-
-        if (FD_ISSET(server_fd, &readfds)) {
-            clnt = malloc(sizeof(struct client));
-
-            client_fd = accept(server_fd, (struct sockaddr*)&clnt->addr,
-                               &client_addr_len);
-            if (client_fd == -1)
-                exit(1);
-            printf("Accepted connection with %s:%d\n",
-                   inet_ntoa(clnt->addr.sin_addr),
-                   ntohs(clnt->addr.sin_port));
-
-            flags = fcntl(client_fd, F_GETFL);
-            fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
-
-            cl_push(&clients, clnt);
-        }
-
-        curr = clients.head;
-        while (curr) {
-            client_fd = curr->data->fd;
-
-            if (FD_ISSET(client_fd, &readfds)) {
-                res = read(client_fd, curr->data->in_buffer, GTCP_BUFF_SIZE);
-                if (res == -1)
-                    continue;
-            }
-            if (FD_ISSET(client_fd, &writefds)) {
-                res = write(client_fd, curr->data->out_buffer, );
-            }
-
-            curr = curr->next;
-        }
-
-        /* res = read(client_fd, buffer, GTCP_BUFF_SIZE); */
-        /* if (res == -1) { */
-        /*     break; */
-        /* } */
-        /**/
-        /* printf( */
-        /*     "Recv '%s' <- %s:%d\n", */
-        /*     buffer, */
-        /*     inet_ntoa(client_addr.sin_addr), */
-        /*     ntohs(client_addr.sin_port) */
-        /* ); */
-        /**/
-        /* res = write(client_fd, buffer, GTCP_BUFF_SIZE); */
-        /* if (res == -1) { */
-        /*     exit(1); */
-        /* } */
-        /*  */
-        /* printf( */
-        /*     "Send '%s' -> %s:%d\n", */
-        /*     buffer, */
-        /*     inet_ntoa(client_addr.sin_addr), */
-        /*     ntohs(client_addr.sin_port) */
-        /* ); */
-        /* clear_buffer(buffer, GTCP_BUFF_SIZE); */
-    }
-    /* Echo Server End */
-
+    gtcp_init(&ctx);
+    gtcp_set_handler(&ctx, echo_handler);
+    gtcp_listen(&ctx);
+    gtcp_event_loop(&ctx);
+    gtcp_free(&ctx);
 }
 
